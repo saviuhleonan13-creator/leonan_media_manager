@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="app-token" content="{{ token }}">
+  <meta name="theme-color" content="#172c29">
+  <title>LEONAN MEDIA MANAGER</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="LEONAN MEDIA MANAGER, início"><span class="brand-mark">L<span>m</span></span><span>LEONAN<small>MEDIA MANAGER</small></span></a>
+      <div class="sidebar-caption"><span>EPISÓDIOS</span><button id="new-episode" class="icon-button" title="Criar episódio" aria-label="Criar episódio">+</button></div>
+      <nav id="episodes" aria-label="Episódios"></nav>
+      <div class="sidebar-bottom"><span class="local-dot"></span> Local. Sob seu controle.<small>V0.1 · LEONAN STUDIO</small></div>
+    </aside>
+    <main>
+      <header class="topbar"><span>Seu acervo de produção</span><div><button id="restore" class="button quiet">Restaurar ZIP</button><a class="button quiet" id="export" href="/api/export" download>Exportar projeto</a><span class="version-tag">V0.1</span></div></header>
+      <div id="app" aria-live="polite"><p class="loading">Abrindo seu acervo…</p></div>
+      <footer>As mídias importadas são cópias. Os arquivos originais permanecem intactos.</footer>
+    </main>
+  </div>
+  <input id="restore-file" type="file" accept=".zip,application/zip" hidden>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="form-dialog"><form id="dialog-form"><div class="dialog-head"><h2 id="dialog-title"></h2><button type="button" class="icon-button close-dialog" aria-label="Fechar">×</button></div><div id="dialog-fields"></div><p id="dialog-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" class="button quiet close-dialog">Cancelar</button><button type="submit" class="button primary">Salvar</button></div></form></dialog>
+  <dialog id="lightbox"><button class="icon-button" id="close-lightbox" aria-label="Fechar imagem">×</button><img id="lightbox-image" alt="Imagem-âncora ampliada"><p id="lightbox-caption"></p></dialog>
+  <noscript>Ative JavaScript no navegador para organizar os episódios. Nenhum serviço externo é utilizado.</noscript>
+</body>
+</html>
