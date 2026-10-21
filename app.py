@@ -15,7 +15,8 @@ import tempfile
 import warnings
 import zipfile
 
-from flask import Flask, jsonify, render_template, request, send_file, send_from_directory
+from flask import Flask, abort, jsonify, render_template, request, send_file, send_from_directory
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from PIL import Image, ImageOps, UnidentifiedImageError
 from werkzeug.exceptions import HTTPException
 
@@ -150,6 +151,8 @@ def create_app(data_dir=None):
     for folder in ("media", "thumbs", "tmp"):
         (root / folder).mkdir(exist_ok=True)
     app.config["DATA_DIR"] = root
+    deletion_signer = URLSafeTimedSerializer(app.config["APP_TOKEN"], salt="leonan-delete-v02")
+    deletion_generations = {}
 
     @contextmanager
     def db():
@@ -172,6 +175,88 @@ def create_app(data_dir=None):
         if row is None:
             raise InputError("Registro não encontrado. Atualize a página.")
         return row
+
+    def project_records(connection):
+        # A single read transaction prevents mixed snapshots during export/state requests.
+        connection.execute("BEGIN")
+        result = {table: [dict(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")]
+                  for table in ("episodes", "takes", "bindings")}
+        # Keep orphan metadata and bytes on disk; expose only active OR historical references.
+        result["assets"] = [dict(row) for row in connection.execute(
+            "SELECT a.* FROM assets a WHERE EXISTS (SELECT 1 FROM bindings b WHERE b.asset_id=a.id) ORDER BY a.id")]
+        return result
+
+    def deletion_snapshot(connection, kind, row_id):
+        table = "episodes" if kind == "episode" else "takes"
+        target = connection.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone()
+        if target is None:
+            abort(404, description="Registro não encontrado ou já excluído. Atualize o acervo.")
+        episode = target if kind == "episode" else require_row(connection, "episodes", target["episode_id"])
+        takes = [dict(row) for row in connection.execute(
+            "SELECT * FROM takes WHERE episode_id=? ORDER BY id" if kind == "episode" else
+            "SELECT * FROM takes WHERE id=? ORDER BY id", (row_id,))]
+        bindings = [dict(row) for row in connection.execute(
+            "SELECT b.* FROM bindings b JOIN takes t ON t.id=b.take_id WHERE t.episode_id=? ORDER BY b.id"
+            if kind == "episode" else "SELECT * FROM bindings WHERE take_id=? ORDER BY id", (row_id,))]
+        snapshot = {"episode": dict(episode), "takes": takes, "bindings": bindings}
+        digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        summary = {"episode": dict(episode), "take": dict(target) if kind == "take" else None,
+                   "take_count": len(takes), "binding_count": len(bindings),
+                   "image_count": len({b["asset_id"] for b in bindings if b["kind"] == "image"}),
+                   "video_count": len({b["asset_id"] for b in bindings if b["kind"] == "video"})}
+        return summary, digest
+
+    def deletion_preview(kind, row_id):
+        with db() as connection:
+            connection.execute("BEGIN")
+            summary, digest = deletion_snapshot(connection, kind, row_id)
+        summary["confirmation_token"] = deletion_signer.dumps(
+            {"kind": kind, "id": row_id, "digest": digest,
+             "generation": deletion_generations.get((kind, row_id), 0)})
+        return jsonify(summary)
+
+    def delete_confirmed(kind, row_id):
+        data = json_object()
+        token = text_field(data, "confirmation_token", 2000)
+        try:
+            review = deletion_signer.loads(token, max_age=600)
+        except (BadSignature, SignatureExpired):
+            raise InputError("A confirmação expirou ou é inválida. Reabra a janela de exclusão.")
+        if review.get("kind") != kind or review.get("id") != row_id:
+            raise InputError("A confirmação não corresponde ao registro selecionado.")
+        if data.get("backup_confirmed") is not True:
+            raise InputError("Confirme que você possui um backup válido antes de excluir.")
+        # No file operations occur here. The record deletion either commits fully or rolls back.
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if review["generation"] != deletion_generations.get((kind, row_id), 0):
+                abort(409, description="O registro desta confirmação já foi excluído. Atualize o acervo.")
+            summary, digest = deletion_snapshot(connection, kind, row_id)
+            if review["digest"] != digest:
+                abort(409, description="O registro mudou desde a conferência. Reabra a confirmação antes de excluir.")
+            if text_field(data, "confirm_code", 1000) != summary["episode"]["code"]:
+                raise InputError("O código informado não corresponde ao episódio selecionado.")
+            if kind == "take" and (type(data.get("confirm_number")) is not int or
+                                    data["confirm_number"] != summary["take"]["number"]):
+                raise InputError("O número confirmado não corresponde ao take selecionado.")
+            if kind == "episode":
+                affected_takes = [row[0] for row in connection.execute("SELECT id FROM takes WHERE episode_id=?", (row_id,))]
+                connection.execute("DELETE FROM bindings WHERE take_id IN (SELECT id FROM takes WHERE episode_id=?)", (row_id,))
+                connection.execute("DELETE FROM takes WHERE episode_id=?", (row_id,))
+                connection.execute("DELETE FROM episodes WHERE id=?", (row_id,))
+            else:
+                affected_takes = [row_id]
+                connection.execute("DELETE FROM bindings WHERE take_id=?", (row_id,))
+                connection.execute("DELETE FROM takes WHERE id=?", (row_id,))
+        # Invalidate every outstanding preview for these records, including reused SQLite IDs.
+        # On restart the signing key changes, invalidating all earlier confirmations.
+        for take_id in affected_takes:
+            key = ("take", take_id)
+            deletion_generations[key] = deletion_generations.get(key, 0) + 1
+        if kind == "episode":
+            key = (kind, row_id)
+            deletion_generations[key] = deletion_generations.get(key, 0) + 1
+        return jsonify(ok=True, deleted=kind, id=row_id)
 
     def store_media(connection, source, name, work, expected_kind=None):
         info = prepare_media(source, name, work)
@@ -230,7 +315,13 @@ def create_app(data_dir=None):
 
     @app.errorhandler(sqlite3.IntegrityError)
     def conflict(error):
+        if request.method == "DELETE":
+            return database_error(error)
         return jsonify(error="Já existe um episódio com esse código ou um take com esse número."), 409
+
+    @app.errorhandler(sqlite3.DatabaseError)
+    def database_error(error):
+        return jsonify(error="O banco de dados não confirmou a operação. Verifique espaço, permissões e outras instâncias abertas; atualize o acervo antes de tentar novamente."), 503
 
     @app.errorhandler(HTTPException)
     def http_error(error):
@@ -244,8 +335,7 @@ def create_app(data_dir=None):
     @app.get("/api/state")
     def state():
         with db() as connection:
-            result = {table: [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
-                      for table in ("episodes", "takes", "assets", "bindings")}
+            result = project_records(connection)
         for asset in result["assets"]:
             asset["thumbnail_url"] = f"/media/{asset['id']}/thumbnail"
             asset["url"] = f"/media/{asset['id']}"
@@ -283,6 +373,22 @@ def create_app(data_dir=None):
             cursor = connection.execute("INSERT INTO takes(episode_id,number,title) VALUES(?,?,?)",
                                         (episode_id, number, text_field(data, "title", 200)))
         return jsonify(id=cursor.lastrowid), 201
+
+    @app.get("/api/episodes/<int:episode_id>/deletion-preview")
+    def preview_episode_deletion(episode_id):
+        return deletion_preview("episode", episode_id)
+
+    @app.get("/api/takes/<int:take_id>/deletion-preview")
+    def preview_take_deletion(take_id):
+        return deletion_preview("take", take_id)
+
+    @app.delete("/api/episodes/<int:episode_id>")
+    def delete_episode(episode_id):
+        return delete_confirmed("episode", episode_id)
+
+    @app.delete("/api/takes/<int:take_id>")
+    def delete_take(take_id):
+        return delete_confirmed("take", take_id)
 
     @app.patch("/api/takes/<int:take_id>")
     def update_take(take_id):
@@ -328,6 +434,8 @@ def create_app(data_dir=None):
         with db() as connection:
             require_row(connection, "takes", take_id)
             asset = require_row(connection, "assets", data.get("asset_id"))
+            if not connection.execute("SELECT 1 FROM bindings WHERE asset_id=? LIMIT 1", (asset["id"],)).fetchone():
+                raise InputError("Esta mídia não tem vínculos restantes. Atualize o seletor ou importe uma cópia novamente.")
             binding_id = bind(connection, take_id, asset["id"], asset["kind"], text_field(data, "version", 40),
                               text_field(data, "label", 200))
         return jsonify(id=binding_id), 201
@@ -367,15 +475,14 @@ def create_app(data_dir=None):
     @app.get("/api/export")
     def export():
         with db() as connection:
-            manifest = {table: [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
-                        for table in ("episodes", "takes", "assets", "bindings")}
+            manifest = project_records(connection)
         manifest["format"] = "leonan-media-manager"
         manifest["version"] = 1
         encoded_manifest = json.dumps(manifest, ensure_ascii=False, indent=2)
         total_size = len(encoded_manifest.encode("utf-8")) + sum(
             (root / "media" / (asset["sha"] + asset["extension"])).stat().st_size for asset in manifest["assets"])
         if total_size > MAX_RESTORE or len(manifest["assets"]) > 9999 or len(encoded_manifest.encode("utf-8")) > 10 * 1024 * 1024:
-            raise InputError("O projeto excede o limite do ZIP da V0.1 (4 GB / 9.999 mídias). Com o aplicativo fechado, copie a pasta de dados inteira como backup.")
+            raise InputError("O projeto excede o limite do ZIP (4 GB / 9.999 mídias). Com o aplicativo fechado, copie a pasta de dados inteira como backup.")
         # Spooled temporary file keeps large projects off the Python heap.
         archive = tempfile.TemporaryFile(dir=root / "tmp")
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as bundle:

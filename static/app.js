@@ -94,7 +94,7 @@ function render() {
   const versionCount = takes.filter(t => ['image','video'].every(kind => {
     const binding = activeBinding(t.id,kind); return binding?.version;
   })).length;
-  $('#app').innerHTML = `<section class="page-heading"><div><p class="eyebrow">ACERVO DE PRODUÇÃO</p><h1>${esc(ep.code)}${ep.title ? ` <span class="muted">/</span> ${esc(ep.title)}` : ''}</h1><p class="muted">Escolha um take. Confira as mídias. Decida o próximo passo.</p></div><button class="button primary" data-action="new-take">+ Novo take</button></section>
+  $('#app').innerHTML = `<section class="page-heading"><div><p class="eyebrow">ACERVO DE PRODUÇÃO</p><h1>${esc(ep.code)}${ep.title ? ` <span class="muted">/</span> ${esc(ep.title)}` : ''}</h1><p class="muted">Escolha um take. Confira as mídias. Decida o próximo passo.</p></div><div class="page-actions"><button class="button primary" data-action="new-take">+ Novo take</button><button class="button quiet small delete-link" data-action="delete-episode">Excluir episódio</button></div></section>
     ${ep.code === 'PILOTO' ? '<p class="notice">PILOTO · As imagens e o clipe são sintéticos. Use este episódio para testar o fluxo antes de importar o EP04.</p>' : ''}
     ${!state.ffmpeg_available ? '<p class="notice">FFmpeg ausente: importação de vídeos indisponível. Veja a instalação no README.</p>' : ''}
     <section class="summary" aria-label="Progresso do episódio">
@@ -126,6 +126,7 @@ function detail() {
     <section class="decision"><h3>Decisão do operador</h3><p>Ter um arquivo não significa estar aprovado. A decisão se aplica ao par de mídias em uso.</p><div class="status-options">${Object.keys(statusLabels).map(status => `<button class="status-option ${take.status === status ? 'selected' : ''}" data-action="status" data-status="${status}" aria-pressed="${take.status === status}">${statusEmoji[status]} ${statusLabels[status]}</button>`).join('')}</div></section>
     <form id="take-form" class="editor"><div class="editor-top"><h3>Informações da cena</h3><span class="save-indicator" id="save-indicator">Informações salvas</span></div><div class="field-row"><label>Nº do take<input name="number" type="number" value="${take.number}" min="1" max="999" required></label><label>Descrição curta<input name="title" value="${esc(take.title)}" maxlength="200" placeholder="Ex.: Caramela manda limpar a cozinha"></label></div><label>Prompt correspondente <span class="muted">(opcional)</span><textarea name="prompt" maxlength="20000" placeholder="Cole o prompt utilizado no Flow…">${esc(take.prompt)}</textarea></label><label>Observações do operador<textarea name="notes" maxlength="20000" placeholder="Continuidade, correções, dúvidas sobre a versão…">${esc(take.notes)}</textarea></label><div class="editor-actions"><span class="field-help">A ordem dos cartões segue o número do take.</span><button class="button" type="submit">Salvar informações</button></div></form>
     <details class="comparison"><summary>Comparar âncoras e continuidade</summary><p>Imagens em uso no episódio, na ordem do roteiro. Clique para ampliar.</p><div class="comparison-grid">${takesForEpisode().map(t => {const binding=activeBinding(t.id,'image');return binding ? `<button class="compare-card" data-action="enlarge" data-id="${binding.asset_id}"><img src="${assetById(binding.asset_id).thumbnail_url}" alt="Âncora do TAKE-${pad(t.number)}" loading="lazy"><span>TAKE-${pad(t.number)} · ${esc(binding.version ? `V${binding.version}` : 'sem versão')}</span></button>` : '';}).join('') || '<p>Nenhuma âncora vinculada.</p>'}</div></details>
+    <div class="deletion-tools"><button class="button quiet small delete-link" data-action="delete-take">Excluir este take</button></div>
     </section>`;
 }
 
@@ -161,12 +162,40 @@ function similarityWarnings(image) {
   }).join('')}<p class="field-help">O aviso usa diferenças visuais aproximadas e pode errar. Não avalia continuidade nem qualidade.</p></aside>`;
 }
 
-function openDialog(title, fields, submit) {
+function openDialog(title, fields, submit, options = {}) {
   $('#dialog-title').textContent = title;
   $('#dialog-fields').innerHTML = fields;
   $('#dialog-error').textContent = '';
+  $('#dialog-submit').textContent = options.submitLabel || 'Salvar';
+  $('#dialog-submit').className = `button ${options.destructive ? 'danger' : 'primary'}`;
   dialogSubmit = submit;
   $('#form-dialog').showModal();
+}
+
+async function deletionDialog(kind) {
+  const isEpisode = kind === 'episode';
+  const id = isEpisode ? episodeId : takeId;
+  const path = `/api/${isEpisode ? 'episodes' : 'takes'}/${id}`;
+  const preview = await api(`${path}/deletion-preview`);
+  const identity = isEpisode ? `${preview.episode.code} — ${preview.episode.title || 'Sem título'}` :
+    `${preview.episode.code} TAKE-${pad(preview.take.number)} — ${preview.take.title || 'Sem descrição'}`;
+  const noun = isEpisode ? 'episódio' : 'take';
+  const fields = `<p class="dialog-copy"><b>${esc(identity)}</b></p>
+    <p class="dialog-copy">${preview.take_count} take(s), ${preview.image_count} imagem(ns) distinta(s), ${preview.video_count} vídeo(s) distinto(s).<br>${preview.binding_count} vínculo(s), contando versões em uso e históricas.</p>
+    <p class="dialog-copy">O ${noun} e seu histórico de versões, prompts, observações e decisões serão removidos do registro. ${isEpisode ? 'Todos os takes deste episódio serão removidos.' : 'Os demais takes manterão seus números e vínculos.'}</p>
+    <p class="dialog-copy">Originais, cópias locais e miniaturas não serão apagados. Mídias usadas em outros takes ou episódios continuarão disponíveis. Cópias sem vínculos ficarão preservadas no disco, mas sairão do seletor e dos avisos de similaridade.</p>
+    <p class="dialog-copy"><b>Não há desfazer nesta tela.</b> Para recuperar os registros excluídos, será necessário restaurar um backup anterior. Um backup posterior não incluirá o ${noun} excluído nem suas mídias exclusivas.</p>
+    ${isEpisode ? `<label>Digite o código ${esc(preview.episode.code)} para confirmar<input name="confirm_code" autocomplete="off" spellcheck="false" maxlength="1000" required></label>` : ''}
+    <label class="confirm-backup"><input type="checkbox" name="backup_confirmed" value="yes" required>Tenho um backup válido anterior à exclusão e entendo a remoção deste ${noun}.</label>`;
+  openDialog(`Excluir ${noun}`, fields, async form => {
+    const data = {confirmation_token:preview.confirmation_token,
+      backup_confirmed:form.get('backup_confirmed') === 'yes',
+      confirm_code:isEpisode ? form.get('confirm_code') : preview.episode.code};
+    if (!isEpisode) data.confirm_number = preview.take.number;
+    await api(path, {method:'DELETE', body:data});
+    await reload();
+    toast(`${isEpisode ? 'Episódio excluído' : 'Take excluído'}. As cópias locais foram preservadas.`);
+  }, {destructive:true, submitLabel:isEpisode ? 'Excluir episódio e histórico' : `Excluir TAKE-${pad(preview.take.number)}`});
 }
 
 function newEpisode() {
@@ -219,6 +248,8 @@ document.addEventListener('click', event => {
       case 'take': takeId=Number(id); render(); break;
       case 'new-episode': newEpisode(); break;
       case 'new-take': newTake(); break;
+      case 'delete-episode': await deletionDialog('episode'); break;
+      case 'delete-take': await deletionDialog('take'); break;
       case 'demo': {const result=await api('/api/demo',{method:'POST'}); episodeId=result.id; takeId=null; await reload(); toast('Piloto criado: 3 takes, 3 âncoras e 1 vídeo sintéticos.'); break;}
       case 'upload': uploadDialog(kind); break;
       case 'reuse': reuseDialog(kind); break;

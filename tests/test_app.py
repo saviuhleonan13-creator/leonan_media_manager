@@ -23,7 +23,7 @@ def png(color="orange", shift=0):
     return buffer.getvalue()
 
 
-class MediaManagerTests(unittest.TestCase):
+class ProjectTestCase(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
@@ -81,6 +81,8 @@ class MediaManagerTests(unittest.TestCase):
                 bundle.writestr(*extra)
         return output.getvalue()
 
+
+class MediaManagerTests(ProjectTestCase):
     def test_initial_screen_and_local_request_protection(self):
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
