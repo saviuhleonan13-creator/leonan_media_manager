@@ -90,3 +90,39 @@ Os 17 testes criam seus próprios bancos, mídias e backups artificiais em diret
 Não houve implantação. Encerrar o teste e deixar de usar esta branch é suficiente; a instalação operacional e a branch V0.2 continuam preservadas. Não copiar banco/mídias de teste de volta e não fazer downgrade sobre pasta de produção. Não é necessária migração reversa porque o esquema não mudou.
 
 Push desta branch, teste Windows, merge e uso real são decisões posteriores distintas. Este documento não autoriza nenhuma delas. Solicitar inicialmente revisão e autorização apenas para push controlado e teste sintético Windows; manter integração e acervo real bloqueados.
+
+## Incidente Windows 01 — fechamento das conexões das fixtures
+
+Em 27/10/2026, o log enviado pelo operador confirmou Python 3.12.10 na revisão `8410ec1`: 17 testes, 8 aprovados e 9 erros durante `TemporaryDirectory.cleanup()`, todos com `WinError 32` em `registry.sqlite3`. A validação Windows dessa revisão está reprovada; os resultados Linux anteriores permanecem somente como histórico. O log pessoal não foi incluído no repositório.
+
+### Diagnóstico e correção mínima
+
+O contexto `with sqlite3.connect(...) as db` confirma/reverte transações, mas não fecha a conexão. Cinco locais no arquivo de testes usavam esse padrão: auxiliar `database()`, criação/remoção de trigger, verificações PRAGMA e criação de trigger na restauração.
+
+Correção: `with closing(sqlite3.connect(...)) as db, db:`. O contexto interno mantém commit/rollback, e o externo chama `close()` tanto no sucesso quanto na exceção. Nenhuma asserção ou cenário dos 17 testes foi removido. Não foram adicionados sleeps, coleta de lixo forçada, exclusão forçada ou supressão de PermissionError.
+
+A conexão de injeção `FailCommit` é criada pelo caminho operacional e já passa pelo `finally: connection.close()` de `app.py`; sua injeção foi preservada. Todas as conexões utilizadas no processo principal dos 17 testes foram acompanhadas na auditoria, inclusive as da aplicação e da restauração. O subprocesso de interrupção somente exercita a cópia de arquivo e não abre SQLite.
+
+### Evidência Linux antes/depois
+
+Uma instrumentação diagnóstica externa à suíte reteve referências das conexões, acompanhou chamadas explícitas a `close()` e verificou o resultado antes da limpeza das fixtures. Na base `8410ec1`, identificou **25 conexões abertas distribuídas exatamente pelos nove testes que falharam no Windows**. Os oito restantes não deixaram conexões abertas. Para liberar os próprios recursos diagnósticos, o instrumento fechou os handles detectados, mas registrou falha de asserção em cada um desses nove casos; isso não integra a correção nem mascara erros da suíte normal.
+
+Depois da correção, a mesma instrumentação terminou com **zero conexões abertas em todos os 17 testes**, incluindo os caminhos de erro e commit simulado. Em seguida, a execução normal, sem instrumentação, passou: **17 testes, zero falhas, zero erros e zero skips**. `git diff --check` também passou.
+
+A reprodução em Linux comprova o vazamento e seu fechamento, não reproduz nativamente a política de bloqueio de arquivos do Windows. O log e a coincidência dos nove casos sustentam o diagnóstico de defeito das fixtures; não comprovam aprovação integral do mecanismo operacional no Windows. Não houve alteração em `app.py` ou no esquema SQLite nesta correção. Não foi repetida a suíte legada de restauração em acervo preenchido.
+
+### Nova validação Windows — pendente de autorização e publicação
+
+Após aprovação, receber a revisão corrigida em outra pasta exclusiva, sem sobrepor a instalação operacional nem reutilizar o código de `8410ec1`. Confirmar o commit entregue. Em PowerShell nessa nova revisão:
+
+```powershell
+py -3.12 --version
+py -3.12 -m venv .venv-piloto02-incidente01
+.\.venv-piloto02-incidente01\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv-piloto02-incidente01\Scripts\python.exe -B -m unittest discover -s tests -p "test_media_integrity.py" -v
+$LASTEXITCODE
+```
+
+Executar um comando por vez e parar se houver erro. Esperado: Python 3.12.10, 17 testes, `OK`, nenhum skip/erro/falha e código zero. Não executar `iniciar.py`, usar administrador, alterar proteções ou limpar diretórios antigos. Os dados dos testes continuam exclusivamente sintéticos e temporários. Enviar o resumo e qualquer traceback, ocultando caminhos pessoais se desejar. Ctrl+C interrompe a execução; nenhum dado do teste deve ser copiado para produção.
+
+A instalação operacional permanece intocada. Push, nova rodada Windows, merge e uso real aguardam as autorizações correspondentes. Este incidente não amplia o escopo; as limitações anteriores de energia, concorrência, órfãos, backup e restauração continuam válidas. O Piloto 02 só poderá ser considerado aprovado nessa etapa após os resultados nativos da revisão corrigida.

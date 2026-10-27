@@ -1,4 +1,6 @@
 """Failure injection uses synthetic media and temporary registries only."""
+from contextlib import closing
+
 import errno
 import hashlib
 import io
@@ -27,7 +29,8 @@ class MediaIntegrityTests(ProjectTestCase):
         publish_verified(source, target, hashlib.sha256(source.read_bytes()).hexdigest(), source.stat().st_size)
 
     def database(self, root=None):
-        with sqlite3.connect((root or self.app.config['DATA_DIR']) / 'registry.sqlite3') as db:
+        # sqlite3 context manages commit/rollback; closing releases Windows handles.
+        with closing(sqlite3.connect((root or self.app.config['DATA_DIR']) / 'registry.sqlite3')) as db, db:
             db.row_factory = sqlite3.Row
             return {table: [{k: row[k] for k in row.keys() if k != 'created_at'}
                             for row in db.execute('SELECT * FROM ' + table + ' ORDER BY id')]
@@ -168,7 +171,7 @@ app.publish_verified(source, target, '0'*64, source.stat().st_size)
         _, take = self.episode_take()
         before = self.database()
         path = self.app.config['DATA_DIR'] / 'registry.sqlite3'
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute("CREATE TRIGGER synthetic_failure BEFORE INSERT ON bindings BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
         response = self.upload(take)
         self.assertEqual(response.status_code, 503)
@@ -177,7 +180,7 @@ app.publish_verified(source, target, '0'*64, source.stat().st_size)
         target = self.app.config['DATA_DIR'] / 'media' / (sha + '.png')
         verify_file(target, sha)
         stamp = target.stat().st_mtime_ns
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute('DROP TRIGGER synthetic_failure')
         self.assertEqual(self.upload(take).status_code, 201)
         self.assertEqual(target.stat().st_mtime_ns, stamp)
@@ -203,7 +206,7 @@ app.publish_verified(source, target, '0'*64, source.stat().st_size)
         self.assertEqual(self.database(root), self.database())
         for path in (root / 'media').iterdir():
             verify_file(path, path.stem)
-        with sqlite3.connect(root / 'registry.sqlite3') as db:
+        with closing(sqlite3.connect(root / 'registry.sqlite3')) as db, db:
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
             self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
 
@@ -235,7 +238,7 @@ app.publish_verified(source, target, '0'*64, source.stat().st_size)
         backup = self.backup_fixture()
         root, client, headers = self.empty_restore_target()
         before = self.database(root)
-        with sqlite3.connect(root / 'registry.sqlite3') as db:
+        with closing(sqlite3.connect(root / 'registry.sqlite3')) as db, db:
             db.execute("CREATE TRIGGER synthetic_failure BEFORE INSERT ON bindings BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
         response = self.restore(backup, client, headers)
         self.assertEqual(response.status_code, 503)
