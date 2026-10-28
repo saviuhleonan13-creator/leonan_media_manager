@@ -15,6 +15,8 @@ import tempfile
 import time
 import urllib.request
 
+from browser_deletion import isolated_server
+
 from PIL import Image
 from playwright.sync_api import sync_playwright, expect
 
@@ -112,22 +114,32 @@ def main():
                 page.locator(".version-list").first.locator("summary").click()
                 page.get_by_role("button", name="Usar", exact=True).first.click()
                 expect(page.locator(".friendly-name")).to_contain_text("V3.1")
-                # Portable ZIP export and additive restore using the visible UI.
+                # Portable ZIP export; restoration only into a second empty registry.
                 with page.expect_download() as download_info:
                     page.locator("#export").click()
                 backup = work / "backup.zip"
                 download_info.value.save_as(backup)
-                page.locator("#restore-file").set_input_files(backup)
-                expect(page.locator(".episode-button")).to_have_count(4)
-                page.reload()
-                expect(page.locator(".episode-button")).to_have_count(4)
-                # Responsive layout: no horizontal body overflow, usable take navigation.
-                page.set_viewport_size({"width":390,"height":844})
-                page.locator(".episode-button").filter(has_text="EP04").first.click()
-                expect(page.locator(".take-detail h2")).to_contain_text("TAKE-04")
-                assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Overflow horizontal"
-                assert not external, f"Requests externos: {external}"
-                assert not errors, f"Erros no navegador: {errors}"
+                page.close()
+                with isolated_server(args.python, work / "empty-restored") as restored_base:
+                    base = restored_base
+                    page = browser.new_page(viewport={"width":1440, "height":1100})
+                    page.on("pageerror", lambda error: errors.append(str(error)))
+                    page.on("console", lambda message: errors.append(message.text) if message.type == "error" else None)
+                    page.on("request", lambda request: external.append(request.url) if not request.url.startswith(base + "/") else None)
+                    page.goto(base)
+                    expect(page.locator(".episode-button")).to_have_count(0)
+                    page.locator("#restore-file").set_input_files(backup)
+                    expect(page.locator(".episode-button")).to_have_count(2)
+                    page.reload()
+                    expect(page.locator(".episode-button")).to_have_count(2)
+                    # Responsive layout: no horizontal body overflow, usable take navigation.
+                    page.set_viewport_size({"width":390,"height":844})
+                    page.locator(".episode-button").filter(has_text="EP04").first.click()
+                    expect(page.locator(".take-detail h2")).to_contain_text("TAKE-04")
+                    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Overflow horizontal"
+                    assert not external, f"Requests externos: {external}"
+                    assert not errors, f"Erros no navegador: {errors}"
+                    page.close()
                 browser.close()
                 print("PASSOU: piloto, reprodução de vídeo, ampliação, episódio/take, importação, versões, aprovação, desvinculação, backup/restauração e layout móvel. Sem requests externos ou erros de JavaScript.")
         finally:

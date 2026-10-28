@@ -1,4 +1,5 @@
 """All fixtures are synthetic and isolated; never open an operator's data directory."""
+from contextlib import closing
 import hashlib
 import io
 import json
@@ -48,7 +49,7 @@ class DeletionTests(ProjectTestCase):
                                   json=data if data is not None else self.confirmation(kind, row_id))
 
     def raw_database(self):
-        with sqlite3.connect(self.root / "project" / "registry.sqlite3") as db:
+        with closing(sqlite3.connect(self.root / "project" / "registry.sqlite3")) as db, db:
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             return {table: db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
@@ -223,12 +224,12 @@ class DeletionTests(ProjectTestCase):
         self.upload(take)
         before, files = self.raw_database(), self.media_bytes()
         data = self.confirmation("episodes", episode)
-        with sqlite3.connect(self.root / "project" / "registry.sqlite3") as db:
+        with closing(sqlite3.connect(self.root / "project" / "registry.sqlite3")) as db, db:
             db.execute("CREATE TRIGGER reject_delete BEFORE DELETE ON takes BEGIN SELECT RAISE(ABORT, 'test'); END")
         self.assertEqual(self.delete("episodes", episode, data).status_code, 503)
         self.assertEqual(before, self.raw_database())
         self.assertEqual(files, self.media_bytes())
-        with sqlite3.connect(self.root / "project" / "registry.sqlite3") as db:
+        with closing(sqlite3.connect(self.root / "project" / "registry.sqlite3")) as db, db:
             db.execute("DROP TRIGGER reject_delete")
         self.assertEqual(self.delete("episodes", episode, data).status_code, 200)
 

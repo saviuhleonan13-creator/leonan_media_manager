@@ -1,6 +1,6 @@
 """Real UI deletion/restore checks using synthetic media in fresh temporary registries."""
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import io
 import json
@@ -200,7 +200,7 @@ def main():
             page.locator('video').evaluate('video => video.pause()')
             page.wait_for_function("[...document.querySelectorAll('.take-card img')].every(i => i.complete && i.naturalWidth > 0)")
             assert hashlib.sha256(video.read_bytes()).hexdigest() == video_hash
-            with sqlite3.connect(root/'original'/'registry.sqlite3') as db:
+            with closing(sqlite3.connect(root/'original'/'registry.sqlite3')) as db, db:
                 assert db.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
                 assert db.execute('PRAGMA foreign_key_check').fetchall() == []
             with page.expect_download() as download:

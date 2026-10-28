@@ -1,4 +1,5 @@
 """Compatibility checks use a frozen V0.1 schema and synthetic files only."""
+from contextlib import closing
 import hashlib
 import io
 import json
@@ -24,7 +25,7 @@ class MigrationTests(ProjectTestCase):
         with Image.open(io.BytesIO(content)) as image:
             image.convert("RGB").save(old / "thumbs" / (sha + ".jpg"))
         schema = (Path(__file__).parent / "fixtures" / "v01_schema.sql").read_text()
-        with sqlite3.connect(old / "registry.sqlite3") as db:
+        with closing(sqlite3.connect(old / "registry.sqlite3")) as db, db:
             db.executescript(schema)
             db.execute("INSERT INTO episodes(id,code,title) VALUES(7,'EP04','Acervo sintético V0.1')")
             db.execute("INSERT INTO takes(id,episode_id,number,title,prompt,notes,status) VALUES(11,7,4,'Cena sintética','Prompt sintético','Observação sintética','approved')")
@@ -38,7 +39,7 @@ class MigrationTests(ProjectTestCase):
                 for path in root.rglob("*") if path.is_file()}
 
     def rows(self, root):
-        with sqlite3.connect(root / "registry.sqlite3") as db:
+        with closing(sqlite3.connect(root / "registry.sqlite3")) as db, db:
             db.row_factory = sqlite3.Row
             return {table: [dict(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY id")]
                     for table in ("episodes", "takes", "bindings", "assets")}

@@ -10,6 +10,7 @@ from pathlib import Path
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import warnings
@@ -57,6 +58,58 @@ CREATE UNIQUE INDEX IF NOT EXISTS active_binding ON bindings(take_id, kind) WHER
 
 class InputError(Exception):
     pass
+
+
+class MediaStorageError(Exception):
+    pass
+
+
+def verify_file(path, expected_sha, expected_size=None):
+    """Compare stored bytes to a trusted digest; never repair existing files."""
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or getattr(metadata, 'st_file_attributes', 0) & 0x400:
+            raise MediaStorageError("Destino de mídia não regular. Nenhum arquivo foi substituído.")
+        with path.open('rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if digest != expected_sha or (expected_size is not None and size != expected_size):
+            raise MediaStorageError("Mídia divergente ou incompleta. Operação recusada; arquivo existente preservado.")
+    except OSError as exc:
+        raise MediaStorageError("Não foi possível verificar a mídia: arquivo ausente ou acesso indisponível. Operação recusada.") from exc
+
+
+def publish_verified(source, target, expected_sha, expected_size):
+    """Stage on destination filesystem, fsync, verify, link without replacement.
+
+    A failed DB transaction may leave a complete orphan. Only this operation's
+    private staging file is removed; a published/existing target is never removed.
+    Filesystems without hard-link support fail closed (no rename/copy fallback).
+    """
+    staging = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.leonan-copy-', dir=target.parent, delete=False) as output:
+            staging = Path(output.name)
+            with source.open('rb') as incoming:
+                shutil.copyfileobj(incoming, output)
+            output.flush()
+            os.fsync(output.fileno())
+        verify_file(staging, expected_sha, expected_size)
+        try:
+            os.link(staging, target)
+        except FileExistsError:
+            # A competing writer or previous failed transaction may own it.
+            pass
+        verify_file(target, expected_sha, expected_size)
+    except OSError as exc:
+        raise MediaStorageError("Falha ao copiar/publicar mídia. Confira espaço, permissões e suporte a vínculos físicos. Nenhum destino foi sobrescrito.") from exc
+    finally:
+        if staging is not None:
+            try:
+                staging.unlink()
+            except OSError:
+                # Preserve residue rather than deleting anything beyond our temp.
+                pass
 
 
 def text_field(data, key, maximum=10000, default=""):
@@ -262,24 +315,26 @@ def create_app(data_dir=None):
         info = prepare_media(source, name, work)
         if expected_kind and info["kind"] != expected_kind:
             raise InputError("O tipo do arquivo não corresponde ao campo escolhido.")
-        existing = connection.execute("SELECT id,kind FROM assets WHERE sha=?", (info["sha"],)).fetchone()
+        size = source.stat().st_size
+        existing = connection.execute("SELECT * FROM assets WHERE sha=?", (info["sha"],)).fetchone()
+        target = root / "media" / (info["sha"] + (existing["extension"] if existing else info["extension"]))
         if existing:
+            verify_file(target, existing["sha"], size)
             return existing["id"], existing["kind"]
-        # Content-addressed copies. Existing media files are never overwritten.
-        target = root / "media" / (info["sha"] + info["extension"])
-        if not target.exists():
-            with target.open("xb") as output, source.open("rb") as original:
-                shutil.copyfileobj(original, output)
+        publish_verified(source, target, info["sha"], size)
         thumbnail = root / "thumbs" / (info["sha"] + ".jpg")
-        if not thumbnail.exists():
-            with thumbnail.open("xb") as output, (work / "thumb.jpg").open("rb") as original:
-                shutil.copyfileobj(original, output)
+        thumb_source = work / "thumb.jpg"
+        with thumb_source.open("rb") as stream:
+            thumb_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+        publish_verified(thumb_source, thumbnail, thumb_sha, thumb_source.stat().st_size)
         columns = list(info)
         cursor = connection.execute(f"INSERT INTO assets ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
                                     tuple(info.values()))
         return cursor.lastrowid, info["kind"]
 
     def bind(connection, take_id, asset_id, kind, version="", label="", active=True, original_name=None):
+        asset = require_row(connection, "assets", asset_id)
+        verify_file(root / "media" / (asset["sha"] + asset["extension"]), asset["sha"])
         if active:
             connection.execute("UPDATE bindings SET active=0 WHERE take_id=? AND kind=?", (take_id, kind))
             connection.execute("UPDATE takes SET status='investigating' WHERE id=?", (take_id,))
@@ -309,13 +364,18 @@ def create_app(data_dir=None):
             response.headers["Cache-Control"] = "no-store"
         return response
 
+    @app.errorhandler(MediaStorageError)
+    def storage_error(error):
+        return jsonify(error=str(error)), 503
+
     @app.errorhandler(InputError)
     def bad_input(error):
         return jsonify(error=str(error)), 400
 
     @app.errorhandler(sqlite3.IntegrityError)
     def conflict(error):
-        if request.method == "DELETE":
+        if (request.method == "DELETE" or request.path == "/api/restore"
+                or request.path.endswith(("/media", "/link"))):
             return database_error(error)
         return jsonify(error="Já existe um episódio com esse código ou um take com esse número."), 409
 
@@ -449,6 +509,8 @@ def create_app(data_dir=None):
                 if key in data:
                     current[key] = text_field(data, key, 40 if key == "version" else 200)
             if data.get("active") is True:
+                asset = require_row(connection, "assets", current["asset_id"])
+                verify_file(root / "media" / (asset["sha"] + asset["extension"]), asset["sha"])
                 connection.execute("UPDATE bindings SET active=0 WHERE take_id=? AND kind=?",
                                    (current["take_id"], current["kind"]))
                 current["active"] = 1
