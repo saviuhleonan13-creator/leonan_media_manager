@@ -16,7 +16,46 @@ import urllib.request
 import zipfile
 
 from PIL import Image
-from playwright.sync_api import sync_playwright, expect
+from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeoutError
+
+
+def wait_for_properties(locator, expression, predicate, description, timeout=30):
+    """Poll DOM properties through DevTools; no page-side eval or CSP bypass.
+
+    JavaScript errors propagate. The deadline includes locator resolution;
+    polling never substitutes a fixed sleep for the required assertion.
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"{description}: timeout de {timeout}s; último estado: {last!r}")
+        try:
+            last = locator.evaluate(expression, timeout=max(1, remaining * 1000))
+        except PlaywrightTimeoutError as exc:
+            raise AssertionError(f"{description}: elemento indisponível dentro de {timeout}s; último estado: {last!r}") from exc
+        if predicate(last):
+            return last
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
+def wait_video_progress(video, timeout=30):
+    return wait_for_properties(
+        video,
+        "video => ({time: video.currentTime, readyState: video.readyState, "
+        "paused: video.paused, error: video.error ? {code: video.error.code, message: video.error.message} : null})",
+        lambda state: state['time'] > 0 and state['error'] is None,
+        "O vídeo não avançou além de zero segundos", timeout)
+
+
+def wait_card_images(page, timeout=30):
+    return wait_for_properties(
+        page.locator('body'),
+        "body => Array.from(body.querySelectorAll('.take-card img'), image => "
+        "({src: image.currentSrc || image.src, complete: image.complete, width: image.naturalWidth, height: image.naturalHeight}))",
+        lambda states: bool(states) and all(s['complete'] and s['width'] > 0 and s['height'] > 0 for s in states),
+        "As imagens dos takes não carregaram com dimensões válidas", timeout)
 
 
 @contextmanager
@@ -196,9 +235,9 @@ def main():
             page.locator(f'[data-action="take"][data-id="{take_ids[9]}"]').click()
             expect(page.locator('.status-chip')).to_have_text('APROVADO')
             page.locator('video').evaluate('async video => { await video.play(); }')
-            page.wait_for_function("document.querySelector('video').currentTime > 0")
+            wait_video_progress(page.locator('video'))
             page.locator('video').evaluate('video => video.pause()')
-            page.wait_for_function("[...document.querySelectorAll('.take-card img')].every(i => i.complete && i.naturalWidth > 0)")
+            wait_card_images(page)
             assert hashlib.sha256(video.read_bytes()).hexdigest() == video_hash
             with closing(sqlite3.connect(root/'original'/'registry.sqlite3')) as db, db:
                 assert db.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
@@ -225,11 +264,11 @@ def main():
                 ninth = next(t for t in restored_state['takes'] if t['number'] == 9)
                 restored_page.locator(f'[data-action="take"][data-id="{ninth["id"]}"]').click()
                 restored_page.locator('video').evaluate('async video => { await video.play(); }')
-                restored_page.wait_for_function("document.querySelector('video').currentTime > 0")
+                wait_video_progress(restored_page.locator('video'))
                 restored_page.locator('video').evaluate('video => video.pause()')
                 restored_page.get_by_role('button',name='Excluir este take',exact=True).click()
                 expect(restored_page.locator('#form-dialog')).to_be_visible()
-                assert restored_page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+                assert restored_page.evaluate('() => document.documentElement.scrollWidth <= window.innerWidth')
                 restored_page.get_by_role('button',name='Cancelar',exact=True).click()
                 restored_page.close()
             assert not failed_media, failed_media

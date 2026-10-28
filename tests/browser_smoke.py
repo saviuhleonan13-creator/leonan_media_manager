@@ -15,7 +15,7 @@ import tempfile
 import time
 import urllib.request
 
-from browser_deletion import isolated_server
+from browser_deletion import isolated_server, wait_video_progress
 
 from PIL import Image
 from playwright.sync_api import sync_playwright, expect
@@ -66,7 +66,7 @@ def main():
                 expect(page.locator("#lightbox")).to_be_visible()
                 page.get_by_role("button", name="Fechar imagem").click()
                 page.locator("video").evaluate("async video => { await video.play(); }")
-                page.wait_for_function("document.querySelector('video').currentTime > 0")
+                wait_video_progress(page.locator("video"))
                 page.locator("video").evaluate("video => video.pause()")
                 if args.screenshot:
                     args.screenshot.parent.mkdir(parents=True, exist_ok=True)
@@ -136,7 +136,7 @@ def main():
                     page.set_viewport_size({"width":390,"height":844})
                     page.locator(".episode-button").filter(has_text="EP04").first.click()
                     expect(page.locator(".take-detail h2")).to_contain_text("TAKE-04")
-                    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Overflow horizontal"
+                    assert page.evaluate("() => document.documentElement.scrollWidth <= window.innerWidth"), "Overflow horizontal"
                     assert not external, f"Requests externos: {external}"
                     assert not errors, f"Erros no navegador: {errors}"
                     page.close()
