@@ -4,6 +4,7 @@ from contextlib import closing, contextmanager
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -58,6 +59,176 @@ def wait_card_images(page, timeout=30):
         "As imagens dos takes não carregaram com dimensões válidas", timeout)
 
 
+UNCONFIRMED_SERVERS = set()
+
+
+def diagnostic(event, **values):
+    print("RECURSOS " + json.dumps({"evento": event, **values}, ensure_ascii=True), flush=True)
+
+
+def log_holders(path):
+    """Read-only diagnostics. Never asks Restart Manager to shut down anything."""
+    if os.name != "nt":
+        holders = set()
+        for process in Path("/proc").glob("[0-9]*"):
+            try:
+                for fd in (process / "fd").iterdir():
+                    try:
+                        if fd.resolve() == path.resolve():
+                            holders.add(int(process.name))
+                    except OSError:
+                        pass  # A descriptor can disappear during this diagnostic snapshot.
+            except (PermissionError, FileNotFoundError):
+                continue
+        return sorted(holders)
+    import ctypes
+    from ctypes import wintypes
+
+    class UniqueProcess(ctypes.Structure):
+        _fields_ = [("pid", wintypes.DWORD), ("started", wintypes.FILETIME)]
+
+    class ProcessInfo(ctypes.Structure):
+        _fields_ = [("process", UniqueProcess), ("name", wintypes.WCHAR * 256),
+                    ("service", wintypes.WCHAR * 64), ("type", ctypes.c_int),
+                    ("status", wintypes.ULONG), ("session", wintypes.DWORD),
+                    ("restartable", wintypes.BOOL)]
+
+    rm = ctypes.WinDLL("Rstrtmgr")
+    handle = wintypes.DWORD()
+    key = ctypes.create_unicode_buffer(33)
+    status = rm.RmStartSession(ctypes.byref(handle), 0, key)
+    if status:
+        raise OSError(status, "RmStartSession")
+    try:
+        names = (wintypes.LPCWSTR * 1)(str(path.resolve()))
+        status = rm.RmRegisterResources(handle, 1, names, 0, None, 0, None)
+        if status:
+            raise OSError(status, "RmRegisterResources")
+        needed, count, reasons = wintypes.UINT(), wintypes.UINT(), wintypes.DWORD()
+        status = rm.RmGetList(handle, ctypes.byref(needed), ctypes.byref(count), None, ctypes.byref(reasons))
+        if status == 0:
+            return []
+        if status != 234:  # ERROR_MORE_DATA
+            raise OSError(status, "RmGetList")
+        entries = (ProcessInfo * needed.value)()
+        count.value = needed.value
+        status = rm.RmGetList(handle, ctypes.byref(needed), ctypes.byref(count), entries, ctypes.byref(reasons))
+        if status:
+            raise OSError(status, "RmGetList (snapshot mudou ou indisponível)")
+        return [entries[i].process.pid for i in range(count.value)]
+    finally:
+        status = rm.RmEndSession(handle)
+        if status:
+            raise OSError(status, "RmEndSession")
+
+
+def resource_snapshot(pid, log_path, phase, observed=None):
+    """Snapshots are evidence, not proof of ownership and never termination targets."""
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=5, check=True)
+            rows = json.loads(result.stdout)
+            parents = {int(r['ProcessId']): int(r['ParentProcessId']) for r in (rows if isinstance(rows, list) else [rows])}
+        else:
+            parents = {}
+            for entry in Path('/proc').glob('[0-9]*/stat'):
+                try:
+                    fields = entry.read_text().rsplit(')', 1)[1].split()
+                    parents[int(entry.parent.name)] = int(fields[1])
+                except FileNotFoundError:
+                    continue
+        descendants = {pid}
+        while True:
+            expanded = descendants | {child for child, parent in parents.items() if parent in descendants}
+            if expanded == descendants:
+                break
+            descendants = expanded
+        if observed is not None:
+            observed.update(descendants - {pid})
+        remaining = sorted((observed or set()).intersection(parents))
+        holders = log_holders(log_path)
+        diagnostic(phase, pid=pid, descendentes=sorted(descendants - {pid}), log=str(log_path),
+                   processos_com_log_aberto=holders, pids_descendentes_observados_ainda_presentes=remaining)
+        return sorted(set(holders) | set(remaining))
+    except Exception as exc:
+        diagnostic(phase, pid=pid, diagnostico_indisponivel=repr(exc))
+
+
+@contextmanager
+def cleanup_after(action):
+    """Keep both failures when a functional error is followed by a cleanup error."""
+    try:
+        yield
+    except BaseException as original:
+        try:
+            action()
+        except BaseException as secondary:
+            raise BaseExceptionGroup("Falha original e falha de encerramento", [original, secondary]) from None
+        raise
+    else:
+        action()
+
+
+@contextmanager
+def synthetic_directory(prefix):
+    # Only a directory freshly created by this invocation can reach rmtree.
+    root = Path(tempfile.mkdtemp(prefix=prefix))
+    diagnostic('diretorio_criado', diretorio=str(root))
+
+    def cleanup():
+        try:
+            if any(server.is_relative_to(root) for server in UNCONFIRMED_SERVERS):
+                raise RuntimeError(f'Encerramento não confirmado; diretório sintético preservado: {root}')
+            subprocess.run([sys.executable, '-B', '-c',
+                            'import shutil,sys; shutil.rmtree(sys.argv[1])', str(root)],
+                           check=True, timeout=15)
+            if root.exists():
+                raise AssertionError(f"Diretório sintético ainda existe: {root}")
+            diagnostic('limpeza_concluida', diretorio=str(root))
+        except BaseException:
+            diagnostic('limpeza_falhou', diretorio=str(root))
+            for path in root.glob('server-*.log'):
+                resource_snapshot(os.getpid(), path, 'log_apos_falha_limpeza')
+            raise
+
+    with cleanup_after(cleanup):
+        yield root
+
+
+@contextmanager
+def managed_browser(playwright):
+    browser = playwright.chromium.launch(executable_path=shutil.which("chromium") or shutil.which("google-chrome"),
+                                         args=["--no-sandbox"])
+
+    def close():
+        failures = []
+        for context in list(browser.contexts):
+            for page in list(context.pages):
+                try:
+                    page.close()
+                except BaseException as exc:
+                    failures.append(exc)
+            try:
+                context.close()
+            except BaseException as exc:
+                failures.append(exc)
+        try:
+            browser.close()
+            if browser.is_connected():
+                raise AssertionError("Navegador ainda conectado após close")
+        except BaseException as exc:
+            failures.append(exc)
+        if failures:
+            raise BaseExceptionGroup("Falhas ao fechar navegador/páginas/contextos", failures)
+        diagnostic('navegador_fechado')
+
+    with cleanup_after(close):
+        yield browser
+
+
 @contextmanager
 def isolated_server(python, root):
     repo = Path(__file__).resolve().parents[1]
@@ -65,10 +236,43 @@ def isolated_server(python, root):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     base = f"http://127.0.0.1:{port}"
-    with (root.parent / f"server-{port}.log").open("w+") as log:
+    log_path = root.parent / f"server-{port}.log"
+    with log_path.open("w+") as log:
         process = subprocess.Popen([python, str(repo / "app.py"), "--port", str(port), "--data-dir", str(root)],
                                    cwd=repo, stdout=log, stderr=log)
-        try:
+        diagnostic('servidor_criado', pid=process.pid, porta=port, diretorio=str(root), log=str(log_path))
+
+        observed = set()
+
+        def stop():
+            UNCONFIRMED_SERVERS.add(root)
+            resource_snapshot(process.pid, log_path, 'antes_encerramento', observed)
+            def close_log():
+                log.close()
+                diagnostic('log_fechado', pid=process.pid, fechado=log.closed)
+                holders = resource_snapshot(process.pid, log_path, 'apos_encerramento', observed)
+                if holders:
+                    raise AssertionError(f'Log ainda aberto ou descendente observado ainda presente: PIDs {holders}; nenhum deles será encerrado automaticamente.')
+
+            with cleanup_after(close_log):
+                if process.poll() is None:
+                    process.terminate()  # Only the Popen-owned PID; shutdown policy unchanged.
+                process.wait(timeout=10)
+                diagnostic('processo_encerrado', pid=process.pid, retorno=process.returncode)
+                deadline = time.monotonic() + 3
+                while True:
+                    with socket.socket() as probe:
+                        probe.settimeout(0.2)
+                        listening = probe.connect_ex(('127.0.0.1', port)) == 0
+                    if not listening:
+                        diagnostic('porta_fechada', pid=process.pid, porta=port)
+                        break
+                    if time.monotonic() >= deadline:
+                        raise AssertionError(f"Porta {port} ainda responde após encerrar PID {process.pid}; nenhum outro processo será encerrado.")
+                    time.sleep(0.05)
+            UNCONFIRMED_SERVERS.discard(root)
+
+        with cleanup_after(stop):
             for _ in range(100):
                 try:
                     urllib.request.urlopen(base + "/api/state", timeout=1).close()
@@ -80,10 +284,8 @@ def isolated_server(python, root):
                     time.sleep(.1)
             else:
                 raise RuntimeError("O servidor de teste não iniciou.")
+            resource_snapshot(process.pid, log_path, 'servidor_pronto', observed)
             yield base
-        finally:
-            process.terminate()
-            process.wait(timeout=10)
 
 
 def signature(state):
@@ -99,11 +301,9 @@ def main():
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--screenshot", type=Path)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="leonan-v02-isolated-") as folder:
+    with synthetic_directory(prefix="leonan-v02-isolated-") as folder:
         root = Path(folder)
-        with isolated_server(args.python, root / "original") as base, sync_playwright() as playwright:
-            browser = playwright.chromium.launch(executable_path=shutil.which("chromium") or shutil.which("google-chrome"),
-                                                 args=["--no-sandbox"])
+        with isolated_server(args.python, root / "original") as base, sync_playwright() as playwright, managed_browser(playwright) as browser:
             page = browser.new_page(viewport={"width":1440, "height":1050})
             errors, failed_media, outside = [], [], []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -274,8 +474,7 @@ def main():
             assert not failed_media, failed_media
             assert not errors, errors
             assert not outside, outside
-            browser.close()
-            print('PASSOU V0.2: exclusão do PILOTO e TAKE, cancelamento, código/backup obrigatórios, erro na UI, biblioteca sem órfãos, mídias compartilhadas inclusive históricas, reversão, continuidade, vídeo/miniaturas, integridade SQLite e exportação/restauração em acervo vazio. Todos os dados eram sintéticos e temporários.')
+    print('PASSOU V0.2: exclusão do PILOTO e TAKE, cancelamento, código/backup obrigatórios, erro na UI, biblioteca sem órfãos, mídias compartilhadas inclusive históricas, reversão, continuidade, vídeo/miniaturas, integridade SQLite e exportação/restauração em acervo vazio. Todos os dados eram sintéticos e temporários.')
 
 
 if __name__ == '__main__':
