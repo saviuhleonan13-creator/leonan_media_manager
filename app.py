@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -311,7 +313,7 @@ def create_app(data_dir=None):
             deletion_generations[key] = deletion_generations.get(key, 0) + 1
         return jsonify(ok=True, deleted=kind, id=row_id)
 
-    def store_media(connection, source, name, work, expected_kind=None):
+    def store_media(connection, source, name, work, expected_kind=None, *, created_at=None):
         info = prepare_media(source, name, work)
         if expected_kind and info["kind"] != expected_kind:
             raise InputError("O tipo do arquivo não corresponde ao campo escolhido.")
@@ -327,6 +329,8 @@ def create_app(data_dir=None):
         with thumb_source.open("rb") as stream:
             thumb_sha = hashlib.file_digest(stream, "sha256").hexdigest()
         publish_verified(thumb_source, thumbnail, thumb_sha, thumb_source.stat().st_size)
+        if created_at is not None:
+            info["created_at"] = created_at
         columns = list(info)
         cursor = connection.execute(f"INSERT INTO assets ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
                                     tuple(info.values()))
@@ -570,6 +574,10 @@ def create_app(data_dir=None):
             try:
                 with zipfile.ZipFile(source) as bundle:
                     manifest = validate_archive(bundle)
+                    compatibility_warnings = [
+                        {"code": "created_at_missing", "asset_id": asset["id"], "sha": asset["sha"],
+                         "message": "Data original de cadastro ausente; não foi recuperada. Novos registros usam a data SQLite da restauração; registros reutilizados mantêm sua data."}
+                        for asset in manifest["assets"] if "created_at" not in asset]
                     with db() as connection:
                         # Force transaction before reading so concurrent restores cannot collide.
                         connection.execute("BEGIN IMMEDIATE")
@@ -581,7 +589,8 @@ def create_app(data_dir=None):
                             with target.open("rb") as incoming:
                                 if hashlib.file_digest(incoming, "sha256").hexdigest() != asset["sha"]:
                                     raise InputError("Backup corrompido: uma mídia não corresponde ao SHA-256 registrado.")
-                            new_id, _ = store_media(connection, target, asset["original_name"], work, asset["kind"])
+                            new_id, _ = store_media(connection, target, asset["original_name"], work, asset["kind"],
+                                                    created_at=asset.get("created_at"))
                             asset_map[asset["id"]] = new_id
                         for episode in manifest["episodes"]:
                             base, code, suffix = episode["code"], episode["code"], 1
@@ -603,7 +612,7 @@ def create_app(data_dir=None):
                                                 binding.get("original_name", source_assets[binding["asset_id"]]["original_name"])))
             except (zipfile.BadZipFile, KeyError, TypeError, ValueError, UnicodeError, RuntimeError, EOFError, AttributeError) as exc:
                 raise InputError("Backup inválido ou incompleto. Use um ZIP exportado pelo LEONAN MEDIA MANAGER.") from exc
-        return jsonify(ok=True, episode_ids=list(episode_map.values()))
+        return jsonify(ok=True, episode_ids=list(episode_map.values()), warnings=compatibility_warnings)
 
     @app.post("/api/demo")
     def demo():
@@ -682,10 +691,22 @@ def validate_archive(bundle):
         for field in ("title", "prompt", "notes"):
             text_field(take, field, 200 if field == "title" else 20000)
     expected_files = {"project.json"}
+    timestamps_by_sha = {}
     for asset in manifest["assets"]:
         sha, extension = asset["sha"], asset["extension"]
         if not isinstance(sha, str) or len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
             raise InputError("Hash inválido no backup.")
+        timestamp = asset.get("created_at")
+        if "created_at" in asset:
+            if not isinstance(timestamp, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}", timestamp):
+                raise InputError("Data de cadastro inválida no backup: use YYYY-MM-DD HH:MM:SS.")
+            try:
+                datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            except ValueError as exc:
+                raise InputError("Data de cadastro impossível no backup.") from exc
+        if sha in timestamps_by_sha and timestamps_by_sha[sha] != timestamp:
+            raise InputError("Datas de cadastro conflitantes para a mesma mídia no backup.")
+        timestamps_by_sha[sha] = timestamp
         if extension not in set(IMAGE_FORMATS.values()) | VIDEO_EXTENSIONS or asset["kind"] not in {"image", "video"}:
             raise InputError("Tipo de mídia inválido no backup.")
         text_field(asset, "original_name", 255)

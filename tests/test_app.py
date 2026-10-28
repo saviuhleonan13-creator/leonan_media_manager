@@ -1,3 +1,6 @@
+from contextlib import closing
+import sqlite3
+
 import hashlib
 import io
 import json
@@ -195,6 +198,9 @@ class MediaManagerTests(ProjectTestCase):
         self.upload(take)
         self.upload(take, png("green"), name="outra versão.png", version="3.1")
         self.patch(f"/api/takes/{take}", {"status": "approved", "notes": "Conferido", "prompt": "Plano médio"})
+        with closing(sqlite3.connect(self.app.config["DATA_DIR"] / "registry.sqlite3")) as db, db:
+            for asset, date in zip(self.state()["assets"], ("2001-02-03 04:05:06", "2002-03-04 05:06:07")):
+                db.execute("UPDATE assets SET created_at=? WHERE id=?", (date, asset["id"]))
         data = self.export()
         destination = create_app(self.root / "restored")
         client = destination.test_client()

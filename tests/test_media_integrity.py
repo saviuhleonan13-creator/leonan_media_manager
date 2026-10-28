@@ -32,7 +32,7 @@ class MediaIntegrityTests(ProjectTestCase):
         # sqlite3 context manages commit/rollback; closing releases Windows handles.
         with closing(sqlite3.connect((root or self.app.config['DATA_DIR']) / 'registry.sqlite3')) as db, db:
             db.row_factory = sqlite3.Row
-            return {table: [{k: row[k] for k in row.keys() if k != 'created_at'}
+            return {table: [{k: row[k] for k in row.keys()}
                             for row in db.execute('SELECT * FROM ' + table + ' ORDER BY id')]
                     for table in ('episodes', 'takes', 'assets', 'bindings')}
 

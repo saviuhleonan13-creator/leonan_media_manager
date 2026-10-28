@@ -1,5 +1,7 @@
 # Candidata isolada V0.3 — integração seletiva
 
+> Histórico da candidata `4a295c3`. Para a revisão de timestamp e o inventário atualizado (84/4/80), consulte [Correção de timestamp](CORRECAO_TIMESTAMP_V03.md). Os comandos e totais abaixo registram a etapa anterior.
+
 Data da execução: 28/10/2026. Autorização do operador: despacho de 27/10/2026. Estado: EM INVESTIGAÇÃO. Preparação isolada e regressão sintética Linux concluídas; publicação, Windows e uso operacional não autorizados nesta etapa.
 
 ## Proveniência e limites
